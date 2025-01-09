@@ -1,0 +1,134 @@
+Below is an example of how you might adapt your ingress-nginx Helm chart configuration for use on Amazon EKS Fargate. The biggest differences when running on Fargate are:
+	1.	No direct control over nodes: You typically remove or simplify nodeSelector and tolerations references, because you do not have traditional nodes to schedule onto. Instead, you use a Fargate profile to match specific namespaces or labels.
+	2.	Fargate profiles: You must define a Fargate profile in EKS that targets the namespace and/or labels you want to run on Fargate. Any pod matching that profile will be scheduled on Fargate.
+	3.	HostPort limitations**: You cannot directly bind to host ports on Fargate. Instead, you typically expose the ingress via a Service of type LoadBalancer or through the AWS Load Balancer Controller (ALB or NLB).
+
+Below is a step-by-step guide and an example:
+
+1. Create a Fargate Profile
+
+When you enable Fargate on an existing EKS cluster, you create a Fargate profile that tells EKS which pods (via namespace or labels) should run on Fargate. For example, if you plan to install ingress-nginx into the ingress-nginx namespace, you can create a Fargate profile like this:
+
+# Using eksctl
+eksctl create fargateprofile \
+  --cluster my-eks-cluster \
+  --name ingress-fargate \
+  --namespace ingress-nginx
+
+This profile says:
+	•	Any pod in the ingress-nginx namespace (by default) will run on Fargate.
+	•	No node selectors or tolerations are needed at the pod level to “force” scheduling on Fargate—EKS automatically schedules it if it matches the profile.
+
+	Tip: You could also match by labels, but the simplest approach is to match by namespace.
+
+2. Create the Namespace (if it doesn’t exist)
+
+Make sure the ingress-nginx namespace exists, because your Fargate profile is looking for pods in that namespace:
+
+kubectl create namespace ingress-nginx
+
+3. Adjust Your Helm Chart Values
+
+Below is an example Helm values file (values-fargate.yaml), showing how you might adapt your original configuration to EKS Fargate. The key changes from your original setup are:
+	•	Remove nodeSelector that references specific nodes (hosts: infrastructure) and replace (or remove entirely) with either empty object {} or a label that you might use in your Fargate profile. In the simplest case, you can omit them, because the Fargate profile is already matching your namespace.
+	•	Remove tolerations for node-based scheduling. Fargate does not use them.
+	•	Keep the Service annotations for an NLB-based, internal load balancer. This part remains the same so that AWS provisions an internal NLB.
+
+ingress-nginx:
+  controller:
+    # If you want replicas, you can set them here
+    replicaCount: 2
+    
+    # Remove or clear the nodeSelector to ensure it does not conflict with Fargate scheduling
+    nodeSelector: {}
+    tolerations: []
+
+    service:
+      type: LoadBalancer
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-name: "lighthouse-nlb"
+        service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+        service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+        service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+        service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-0aab7f143909dce18,subnet-045407bd2d047c80f"
+        service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "Name=internal-load-balancer,Application=Lighthouse,Division=Shared Services,Function=Manufacturing,Department=IT,Environment=Development,L1_Technical_Owner=joseph.muli@iff.com,L2_Technical_Owner=meena.n@iff.com,L3_Technical_Owner=sudhir.jena@iff.com,ITLT_Owner=richard.kronengold@iff.com,Business_Owner=fernando.gomes@iff.com"
+      labels:
+        app.kubernetes.io/name: ingress-nlb
+        app.kubernetes.io/instance: ingress-nlb
+      externalTrafficPolicy: Local
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+    admissionWebhooks:
+      patch:
+        # Also remove or clear nodeSelector/tolerations for admission webhook pods
+        nodeSelector: {}
+        tolerations: []
+
+  defaultBackend:
+    # If you plan to use a default backend on Fargate, do the same:
+    nodeSelector: {}
+    tolerations: []
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+
+  # Keep your naming override if you prefer
+  nameOverride: "ingress-nlb"
+  fullnameOverride: "ingress-nlb"
+  
+  revisionHistoryLimit: 3
+
+Helm Install Example
+
+Install or upgrade your chart with these values:
+
+helm upgrade --install ingress-nlb \
+  ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  -f values-fargate.yaml
+
+This assumes:
+	•	You have already added the ingress-nginx helm repo:
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+	•	You’re installing into the ingress-nginx namespace, which is mapped to Fargate via the Fargate profile you created earlier.
+
+4. Verify the Setup
+
+After installing, verify that your pods in the ingress-nginx namespace are running under Fargate:
+
+kubectl get pods -n ingress-nginx -o wide
+
+You should see the Fargate mention under the NODE column (or a random string node name that indicates it’s a Fargate-managed instance rather than a normal EC2 node).
+
+Check that your LoadBalancer service is up:
+
+kubectl get svc -n ingress-nginx
+
+You should see a service of type LoadBalancer with an internal NLB (since you used service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"). It will provision an internal-facing DNS name you can use within your VPC to route traffic.
+
+5. Known Limitations / Tips
+	1.	HostPort and DaemonSet: Fargate does not support DaemonSets or pods needing hostPort. Make sure your ingress configuration relies purely on type: LoadBalancer for external traffic.
+	2.	No direct node scheduling: The Fargate profile is your scheduling mechanism. If your pods do not appear on Fargate, confirm your namespace, labels, and Fargate profile are correctly matched.
+	3.	IAM Roles for Service Accounts (IRSA): If your ingress controller needs specific IAM permissions, consider using IRSA. You won’t have an underlying EC2 node to attach instance roles to, so the recommended approach on EKS Fargate is to attach roles to service accounts. (See AWS docs on IRSA for EKS.)
+	4.	Pod limits: Fargate enforces certain CPU/memory combinations. Ensure your resource requests and limits fit the available Fargate resource “bundles” (e.g., 0.25 vCPU/0.5GB, 0.5 vCPU/1GB, etc.). If the resources in your Helm chart do not fit a valid Fargate profile configuration, the pod could fail scheduling.
+
+Summary
+
+To replicate your ingress-nginx setup on EKS Fargate:
+	1.	Create a Fargate profile that matches the namespace (ingress-nginx) or a specific label.
+	2.	Remove node selectors and tolerations in your Helm values that reference on-prem or EC2-based scheduling.
+	3.	Keep your NLB annotations the same so AWS creates an NLB with the desired configuration (internal, subnets, extra tags, etc.).
+	4.	Deploy with Helm to the namespace that Fargate manages, and verify pods are scheduled on Fargate.
+
+Following these adjustments, you should have an internal NLB-backed Ingress controller running on AWS Fargate.
