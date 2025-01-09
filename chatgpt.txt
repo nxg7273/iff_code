@@ -1,1 +1,204 @@
+Below is an updated values.yaml that removes the global OIDC middleware references from the entryPoints (so OIDC is no longer implicitly applied to every route). Then, you’ll create a separate OIDC middleware resource (CRD) for any IngressRoute(s) that actually need OIDC. This approach resolves the problem of skipping OIDC on certain routes (like /api) while still allowing OIDC protection for the rest of your paths.
 
+1. Updated values.yaml
+
+In this version, we’ve removed:
+
+middlewares:
+  - bioactivespage-oidcauth@kubernetescrd
+
+from both web and websecure in the static configuration. Everything else remains the same, including the authSources.oidcSource block, so Traefik still knows how to connect to Microsoft Entra ID (Azure AD). But we’re no longer forcing OIDC on all routes automatically.
+
+cluster: protein-engineering-cluster-new
+
+image:
+    registry: 938398057556.dkr.ecr.us-east-1.amazonaws.com
+    repository: traefikee-ecr-repository
+    pullPolicy: IfNotPresent
+    tag: "v2.11.2"
+
+initImage:
+    registry: 938398057556.dkr.ecr.us-east-1.amazonaws.com
+    repository: busybox-ecr-repository
+    tag: "1.36.1"
+
+log:
+    level: DEBUG
+    format: JSON
+
+controller:
+  staticConfig:
+    content: |
+      entryPoints:
+        web:
+          address: ":7080"
+          http:
+            # Remove the OIDC middleware from here
+            redirections:
+              entryPoint:
+                to: websecure
+                scheme: https
+                permanent: true
+        websecure:
+          address: ":7443"
+          http:
+            # Remove the OIDC middleware from here
+        traefik:
+          address: ":9000"
+
+      ping:
+        entryPoint: "traefik"
+
+      log:
+        level: DEBUG
+
+      accessLog:
+        format: json
+        fields:
+          defaultMode: keep
+          headers:
+            defaultMode: keep
+
+      api:
+        dashboard: true
+      apiportal:
+        path: /openapi.yaml
+
+      providers:
+        kubernetesCRD:
+          allowExternalNameServices: true
+          allowCrossNamespace: true
+        kubernetesIngress:
+          allowExternalNameServices: true
+
+      cluster:
+        cleanup:
+          gracePeriod: 2m
+
+      certificatesResolvers:
+        le:
+          acme:
+            email: "mymail@domain.tld"
+            tlsChallenge: {}
+
+      metrics:
+        prometheus: {}
+
+      authSources:
+        oidcSource:
+          oidc:
+            issuer: "https://login.microsoftonline.com/a2a9bf31-fc44-425c-a6d2-3ae9379573ea/v2.0"
+            clientID: "0efee129-77a4-4d23-8a96-e256d34da134"
+
+
+proxy:
+    serviceAnnotations:
+        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+        service.beta.kubernetes.io/aws-load-balancer-type: external
+        service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+        service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:us-east-1:938398057556:certificate/55a92faa-7469-4a1b-b5f4-c6c597bfc6b8"
+        service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+        service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "Environment=Dev,Application=NSVA,Division=SharedServices,Business_Owner=ramon.domingo@iff.com,ITLT_Owner=richard.kronengold@iff.com,L1_Technical_Owner=sudhir.jena@iff.com,Functions=ResearchandDevelopment"
+
+    readinessProbe:
+        httpGet:
+            path: /ping
+            port: traefik
+        initialDelaySeconds: 4
+        periodSeconds: 5
+    livenessProbe:
+        httpGet:
+            path: /ping
+            port: traefik
+        initialDelaySeconds: 4
+        periodSeconds: 5
+
+mesh:
+    enabled: false
+
+volumeClaimTemplates:
+    storageClassName: efs-sc
+
+disableChown: true
+
+2. Create an OIDC Middleware Resource
+
+With the OIDC references removed from the static config, you control OIDC on a per-route basis using a custom Middleware resource in Kubernetes. For example:
+
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: oidc-middleware
+  namespace: traefikee  # or whichever namespace your IngressRoute is in
+spec:
+  plugin:
+    oidcAuth:
+      source: oidcSource
+      # Additional options (redirectURL, etc.) if needed
+
+Explanation:
+	•	source: oidcSource references the authSources.oidcSource block in your static config.
+	•	If you need a custom redirectURL, session.secret, or other OIDC plugin fields, add them under oidcAuth: here.
+	•	Now you can attach oidc-middleware to your IngressRoutes that must be protected.
+
+3. IngressRoutes That Use or Skip OIDC
+
+Example 1: OIDC Protected Route
+
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: protected-route
+  namespace: traefikee
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`my-secure-app.iff.com`)
+      kind: Rule
+      middlewares:
+        - name: oidc-middleware
+      services:
+        - name: my-app-service
+          port: 80
+
+Any request to my-secure-app.iff.com on websecure now triggers OIDC login.
+
+Example 2: Skip OIDC for /api
+
+If you want an endpoint that does not require OIDC, simply leave out the oidc-middleware reference:
+
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: api-route
+  namespace: traefikee
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`my-secure-app.iff.com`) && PathPrefix(`/api`)
+      kind: Rule
+      # no middlewares => no OIDC forced
+      services:
+        - name: my-api-service
+          port: 8080
+
+Requests to my-secure-app.iff.com/api/... skip the login flow. Everything else on that host might still require OIDC if it has a separate route referencing oidc-middleware.
+
+4. Deploying These Changes
+	1.	Update the Helm release with the new values.yaml, removing the old OIDC references from entryPoints.web and entryPoints.websecure.
+	2.	Create the Middleware CRD snippet for OIDC in the appropriate namespace:
+
+kubectl apply -f oidc-middleware.yaml
+
+
+	3.	Adjust your IngressRoutes to add or remove the oidc-middleware as desired.
+
+Summary
+	•	By removing the OIDC references from the static config (entryPoints.*.middlewares), you stop enforcing OIDC globally.
+	•	You introduce a dedicated Middleware object for OIDC, referencing authSources.oidcSource.
+	•	Each IngressRoute can now selectively apply or skip OIDC by referencing (or omitting) oidc-middleware.
+	•	This solves the problem of wanting to skip or override OIDC for routes like /api.
+
+Use this updated approach to precisely manage which services or paths require authentication, and which should bypass it.
