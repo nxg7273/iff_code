@@ -1,1 +1,60 @@
 
+ingress-nginx:
+  controller:
+    nodeSelector:
+      hosts: infrastructure
+    tolerations:
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+    service:
+      type: LoadBalancer
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-name: "lighthouse-nlb"
+        service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+        service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+        service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+        service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-0aab7f143909dce18,subnet-045407bd2d047c80f"
+        service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "Name=internal-load-balancer,Application=Lighthouse,Division=Shared Services,Function=Manufacturing,Department=IT,Environment=Development,L1_Technical_Owner=joseph.muli@iff.com,L2_Technical_Owner=meena.n@iff.com,L3_Technical_Owner=sudhir.jena@iff.com,ITLT_Owner=richard.kronengold@iff.com,Business_Owner=fernando.gomes@iff.com"
+      labels:
+        app.kubernetes.io/name: ingress-nlb
+        app.kubernetes.io/instance: ingress-nlb
+      externalTrafficPolicy: Local
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+    admissionWebhooks:
+      patch:
+        nodeSelector:
+          hosts: infrastructure
+        tolerations:
+          - key: "CriticalAddonsOnly"
+            operator: "Exists"
+            effect: "NoSchedule"
+
+  defaultBackend:
+    nodeSelector:
+      hosts: infrastructure
+    tolerations:
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+
+  nameOverride: "ingress-nlb"
+  fullnameOverride: "ingress-nlb"
+
+  revisionHistoryLimit: 3
